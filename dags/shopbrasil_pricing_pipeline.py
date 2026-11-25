@@ -3,7 +3,7 @@ import pendulum
 from airflow.decorators import dag, task, task_group
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from datetime import timedelta
-from operators.schema_validator import  
+from operators.schema_validator import ValidarProdutosOperator
 
 # ==========================================
 # 1. CALLBACKS DE CICLO DE VIDA E ALERTAS
@@ -40,9 +40,17 @@ default_args = {
 )
 def shopbrasil_pricing_pipeline():
 
+    # ==========================================
+    # 3. INGESTÃO DOS DADOS
+    # ==========================================
     @task_group(group_id='ingestao_dados')
     def ingestao():
-        
+
+        # ==========================================
+        # EXTRAÇÃO: BUSCAR PRODUTOS
+        # Busca os produtos na FakeStore API e retorna o JSON.
+        # Se a API der erro o Airflow tenta de novo (3 retries).
+        # ==========================================
         @task(
             on_success_callback=on_success_callback,
             on_retry_callback=on_retry_callback
@@ -57,12 +65,22 @@ def shopbrasil_pricing_pipeline():
                 print(f"Erro ao conectar na API: {e}")
                 raise 
 
+        # ==========================================
+        # EXTRAIR CATEGORIAS
+        # Pega as categorias sem repetir, pra gerar
+        # uma task de métricas pra cada uma.
+        # ==========================================
         @task
         def extrair_categorias(produtos):
             categorias = {produto['category'] for produto in produtos}
             return list(categorias)
 
         produtos_brutos = buscar_produtos()
+        # ==========================================
+        # VALIDAÇÃO DOS PRODUTOS
+        # Operator criado em plugins/operators/schema_validator.py.
+        # Confere id, title, price, category e se o preço é negativo.
+        # ==========================================
         produtos = ValidarProdutosOperator(
             task_id='validar_produtos', produtos=produtos_brutos
         ).output
@@ -70,9 +88,18 @@ def shopbrasil_pricing_pipeline():
 
         return produtos, categorias
 
+    # ==========================================
+    # 4. ANÁLISE DAS MÉTRICAS
+    # ==========================================
     @task_group(group_id='analise_metricas')
     def analise(produtos, categorias):
-        
+
+        # ==========================================
+        # TRATAMENTO: MÉTRICAS POR CATEGORIA
+        # Filtra os produtos da categoria e calcula quantidade,
+        # preço médio, mínimo e máximo. Roda uma vez por categoria
+        # (expand) e usa o pool ecommerce_pool.
+        # ==========================================
         @task(pool='ecommerce_pool')
         def calcular_metricas_categoria(categoria, todos_produtos):
             produtos_cat = [p for p in todos_produtos if p['category'] == categoria]
@@ -85,6 +112,10 @@ def shopbrasil_pricing_pipeline():
                 'preco_maximo': max(precos)
             }
 
+        # ==========================================
+        # CONSOLIDAR RESULTADOS
+        # Junta o resultado de todas as categorias numa lista só.
+        # ==========================================
         @task
         def consolidar_resultados(metricas_mapeadas):
             return list(metricas_mapeadas)
@@ -92,9 +123,18 @@ def shopbrasil_pricing_pipeline():
         metricas = calcular_metricas_categoria.partial(todos_produtos=produtos).expand(categoria=categorias)
         return consolidar_resultados(metricas)
 
+    # ==========================================
+    # 5. CARGA NO BANCO
+    # ==========================================
     @task_group(group_id='carga_banco')
     def carga(metricas_consolidadas, data_execucao=None):
-        
+
+        # ==========================================
+        # CARGA: GRAVAR NO POSTGRES
+        # Cria as tabelas se não existirem e grava as métricas.
+        # No pricing_snapshot apaga o dia antes de inserir (pra não
+        # duplicar se rodar de novo), no pricing_history só insere.
+        # ==========================================
         @task
         def gravar_postgres(metricas, ds=None):
             hook = PostgresHook(postgres_conn_id='postgres_shopbrasil')
